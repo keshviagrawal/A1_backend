@@ -14,13 +14,24 @@ const registrationSchema = new mongoose.Schema(
     },
     status: {
       type: String,
-      enum: ["REGISTERED", "CANCELLED", "ATTENDED", "PURCHASED"],
+      enum: ["REGISTERED", "CANCELLED", "ATTENDED", "PURCHASED", "PENDING_APPROVAL", "APPROVED", "REJECTED"],
       default: "REGISTERED",
     },
     attended: {
       type: Boolean,
       default: false,
     },
+    attendedAt: {
+      type: Date,
+    },
+    attendanceAuditLog: [
+      {
+        action: { type: String, enum: ["MARK", "UNMARK", "OVERRIDE"] },
+        reason: String,
+        performedBy: String, // userId of the organizer
+        timestamp: { type: Date, default: Date.now },
+      },
+    ],
     registeredAt: {
       type: Date,
       default: Date.now,
@@ -51,6 +62,18 @@ const registrationSchema = new mongoose.Schema(
 
     qrCode: {
       type: String,
+    },
+
+    // Payment approval fields (merchandise)
+    paymentProof: {
+      type: String, // uploaded image path
+    },
+    paymentStatus: {
+      type: String,
+      enum: ["PENDING", "APPROVED", "REJECTED"],
+    },
+    paymentReviewedAt: {
+      type: Date,
     },
   },
   { timestamps: true }

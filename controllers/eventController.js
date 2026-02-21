@@ -29,6 +29,7 @@ exports.createEvent = async (req, res) => {
       registrationFee,
       tags,
       merchandiseDetails,
+      customForm,
     } = req.body;
 
     const organizer = await OrganizerProfile.findOne({
@@ -56,18 +57,20 @@ exports.createEvent = async (req, res) => {
       registrationDeadline,
       eventStartDate,
       eventEndDate,
-      registrationLimit,
+      registrationLimit: registrationLimit || 0,
       registrationFee: eventType === "MERCHANDISE" ? merchandiseDetails.price : registrationFee,
       tags: tags || [],
       organizerId: organizer._id,
       status: "DRAFT",
       merchandiseDetails: eventType === "MERCHANDISE" ? merchandiseDetails : undefined,
+      customForm: customForm || [],
     });
 
     res.status(201).json({ message: "Event created", event });
   } catch (error) {
+    console.error("Create event error:", error);
     res.status(500).json({
-      message: "Failed to create event",
+      message: error.message || "Failed to create event",
       error: error.message,
     });
   }
@@ -186,7 +189,7 @@ exports.registerForEvent = async (req, res) => {
   }
 };
 
-// Purchase Merchandise
+// Purchase Merchandise (with payment approval workflow)
 exports.purchaseMerchandise = async (req, res) => {
   try {
     const { eventId } = req.params;
@@ -210,6 +213,11 @@ exports.purchaseMerchandise = async (req, res) => {
       return res.status(400).json({ message: "Purchase deadline has passed" });
     }
 
+    // Payment proof is required
+    if (!req.file) {
+      return res.status(400).json({ message: "Payment proof image is required" });
+    }
+
     const participant = await ParticipantProfile.findOne({
       userId: req.user.userId,
     }).populate("userId");
@@ -229,6 +237,7 @@ exports.purchaseMerchandise = async (req, res) => {
     const existingPurchases = await Registration.find({
       eventId,
       participantId: participant._id,
+      status: { $nin: ["CANCELLED", "REJECTED"] },
     });
 
     const totalPurchased = existingPurchases.reduce(
@@ -236,7 +245,7 @@ exports.purchaseMerchandise = async (req, res) => {
       0
     );
 
-    if (totalPurchased + quantity > event.merchandiseDetails.purchaseLimitPerParticipant) {
+    if (totalPurchased + parseInt(quantity) > event.merchandiseDetails.purchaseLimitPerParticipant) {
       return res.status(400).json({
         message: `Purchase limit is ${event.merchandiseDetails.purchaseLimitPerParticipant} items per participant`,
       });
@@ -251,46 +260,131 @@ exports.purchaseMerchandise = async (req, res) => {
       return res.status(400).json({ message: "Selected variant not available" });
     }
 
-    if (variant.stock < quantity) {
+    if (variant.stock < parseInt(quantity)) {
       return res.status(400).json({
         message: `Only ${variant.stock} items left in stock for this variant`,
       });
     }
 
     // Calculate total amount
-    const totalAmount = event.merchandiseDetails.price * quantity;
+    const totalAmount = event.merchandiseDetails.price * parseInt(quantity);
 
-    // Generate unique ticket ID
+    // Save payment proof path
+    const paymentProofPath = `/uploads/payments/${req.file.filename}`;
+
+    // Create registration with PENDING_APPROVAL status
+    // NO QR code generated, NO stock decremented yet
+    const registration = await Registration.create({
+      eventId,
+      participantId: participant._id,
+      status: "PENDING_APPROVAL",
+      paymentProof: paymentProofPath,
+      paymentStatus: "PENDING",
+      merchandisePurchase: {
+        size,
+        color,
+        quantity: parseInt(quantity),
+        totalAmount,
+      },
+    });
+
+    res.status(201).json({
+      message: "Order placed successfully. Pending organizer approval.",
+      registration,
+      totalAmount,
+    });
+  } catch (error) {
+    res.status(500).json({
+      message: "Purchase failed",
+      error: error.message,
+    });
+  }
+};
+
+// Get merchandise orders for an event (organizer)
+exports.getMerchOrders = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { status } = req.query;
+
+    const query = { eventId };
+    if (status && status !== "ALL") {
+      query.paymentStatus = status;
+    } else {
+      // Only show merchandise orders (those with paymentStatus set)
+      query.paymentStatus = { $exists: true };
+    }
+
+    const orders = await Registration.find(query)
+      .populate({
+        path: "participantId",
+        populate: { path: "userId", select: "email" },
+      })
+      .sort({ createdAt: -1 });
+
+    res.json(orders);
+  } catch (error) {
+    res.status(500).json({ message: "Failed to fetch orders", error: error.message });
+  }
+};
+
+// Approve merchandise payment (organizer)
+exports.approveMerchPayment = async (req, res) => {
+  try {
+    const { eventId, orderId } = req.params;
+
+    const registration = await Registration.findById(orderId).populate({
+      path: "participantId",
+      populate: { path: "userId", select: "email" },
+    });
+
+    if (!registration) {
+      return res.status(404).json({ message: "Order not found" });
+    }
+
+    if (registration.eventId.toString() !== eventId) {
+      return res.status(400).json({ message: "Order does not belong to this event" });
+    }
+
+    if (registration.paymentStatus !== "PENDING") {
+      return res.status(400).json({ message: "Order is not in pending status" });
+    }
+
+    const event = await Event.findById(eventId);
+    if (!event) {
+      return res.status(404).json({ message: "Event not found" });
+    }
+
+    const { size, color, quantity } = registration.merchandisePurchase;
+
+    // Verify stock is still available
+    const variant = event.merchandiseDetails.variants.find(
+      (v) => v.size === size && v.color === color
+    );
+
+    if (!variant || variant.stock < quantity) {
+      return res.status(400).json({ message: "Insufficient stock for this variant" });
+    }
+
+    // Generate ticket + QR
     const ticketId = uuidv4();
-
-    // Create QR data
     const qrData = JSON.stringify({
       eventName: event.eventName,
       eventId: event._id,
       ticketId: ticketId,
-      participant: participant.userId.email,
+      participant: registration.participantId.userId.email,
     });
 
-    // Generate QR buffer (for email attachment)
     const qrCodeBuffer = await QRCode.toBuffer(qrData);
-
-    // Generate Base64 (for DB storage)
     const qrCodeImage = await QRCode.toDataURL(qrData);
 
-    // Create registration/purchase
-    const registration = await Registration.create({
-      eventId,
-      participantId: participant._id,
-      status: "PURCHASED",
-      ticketId,
-      qrCode: qrCodeImage,  // 👈 ADD THIS
-      merchandisePurchase: {
-        size,
-        color,
-        quantity,
-        totalAmount,
-      },
-    });
+    // Update registration
+    registration.status = "APPROVED";
+    registration.paymentStatus = "APPROVED";
+    registration.paymentReviewedAt = new Date();
+    registration.ticketId = ticketId;
+    registration.qrCode = qrCodeImage;
+    await registration.save();
 
     // Decrement stock
     await Event.updateOne(
@@ -307,36 +401,64 @@ exports.purchaseMerchandise = async (req, res) => {
       }
     );
 
-    await sendEmail({
-      to: participant.userId.email,
-      subject: "Merchandise Purchase Successful",
-      html: `
-      <h2>Purchase Confirmed!</h2>
-      <p><strong>Item:</strong> ${event.merchandiseDetails.itemName}</p>
-      <p><strong>Ticket ID:</strong> ${ticketId}</p>
-      <p><strong>Total Paid:</strong> ₹${totalAmount}</p>
-      <img src="cid:merch-qrcode" width="200" />
-    `,
-      attachments: [
-        {
-          filename: "qrcode.png",
-          content: qrCodeBuffer,
-          cid: "merch-qrcode",
-        },
-      ],
-    });
+    // Send confirmation email
+    try {
+      await sendEmail({
+        to: registration.participantId.userId.email,
+        subject: "Merchandise Purchase Approved!",
+        html: `
+          <h2>Payment Approved!</h2>
+          <p><strong>Item:</strong> ${event.merchandiseDetails.itemName}</p>
+          <p><strong>Ticket ID:</strong> ${ticketId}</p>
+          <p><strong>Total Paid:</strong> ₹${registration.merchandisePurchase.totalAmount}</p>
+          <p>Show this QR code for pickup:</p>
+          <img src="cid:merch-qrcode" width="200" />
+        `,
+        attachments: [
+          {
+            filename: "qrcode.png",
+            content: qrCodeBuffer,
+            cid: "merch-qrcode",
+          },
+        ],
+      });
+    } catch (emailErr) {
+      console.error("Email failed but order approved:", emailErr);
+    }
 
-    res.status(201).json({
-      message: "Purchase successful",
-      registration,
-      ticketId,
-      totalAmount,
-    });
+    res.json({ message: "Payment approved, ticket generated", registration });
   } catch (error) {
-    res.status(500).json({
-      message: "Purchase failed",
-      error: error.message,
-    });
+    res.status(500).json({ message: "Failed to approve payment", error: error.message });
+  }
+};
+
+// Reject merchandise payment (organizer)
+exports.rejectMerchPayment = async (req, res) => {
+  try {
+    const { eventId, orderId } = req.params;
+
+    const registration = await Registration.findById(orderId);
+
+    if (!registration) {
+      return res.status(404).json({ message: "Order not found" });
+    }
+
+    if (registration.eventId.toString() !== eventId) {
+      return res.status(400).json({ message: "Order does not belong to this event" });
+    }
+
+    if (registration.paymentStatus !== "PENDING") {
+      return res.status(400).json({ message: "Order is not in pending status" });
+    }
+
+    registration.status = "REJECTED";
+    registration.paymentStatus = "REJECTED";
+    registration.paymentReviewedAt = new Date();
+    await registration.save();
+
+    res.json({ message: "Payment rejected", registration });
+  } catch (error) {
+    res.status(500).json({ message: "Failed to reject payment", error: error.message });
   }
 };
 
@@ -355,7 +477,10 @@ exports.getMyRegistrations = async (req, res) => {
 
     const registrations = await Registration.find({
       participantId: participant._id,
-    }).populate("eventId");
+    }).populate({
+      path: "eventId",
+      populate: { path: "organizerId", select: "organizerName" }
+    });
 
     res.json(registrations);
   } catch (error) {
@@ -559,12 +684,9 @@ exports.getPublishedEvents = async (req, res) => {
 
     let query = { status: "PUBLISHED" };
 
-    /* ---------- Search (Event + Organizer) ---------- */
+    /* ---------- Search (Event Name) ---------- */
     if (search) {
-      query.$or = [
-        { eventName: { $regex: search, $options: "i" } },
-        { organizerName: { $regex: search, $options: "i" } },
-      ];
+      query.eventName = { $regex: search, $options: "i" };
     }
 
     /* ---------- Filters ---------- */
@@ -577,13 +699,15 @@ exports.getPublishedEvents = async (req, res) => {
     }
 
     if (startDate && endDate) {
-      query.eventDate = {
+      query.eventStartDate = {
         $gte: new Date(startDate),
         $lte: new Date(endDate),
       };
     }
 
-    const events = await Event.find(query).sort({ createdAt: -1 });
+    const events = await Event.find(query)
+      .populate("organizerId", "organizerName")
+      .sort({ createdAt: -1 });
 
     res.json(events);
   } catch (err) {
@@ -593,14 +717,22 @@ exports.getPublishedEvents = async (req, res) => {
 
 exports.getTrendingEvents = async (req, res) => {
   try {
+    const { type } = req.query;
     const twentyFourHoursAgo = new Date(
       Date.now() - 24 * 60 * 60 * 1000
     );
 
-    const trending = await Event.find({
+    const filter = {
       createdAt: { $gte: twentyFourHoursAgo },
       status: "PUBLISHED",
-    })
+    };
+
+    if (type) {
+      filter.eventType = type;
+    }
+
+    const trending = await Event.find(filter)
+      .populate("organizerId", "organizerName")
       .sort({ registrationsCount: -1 })
       .limit(5);
 
@@ -612,7 +744,8 @@ exports.getTrendingEvents = async (req, res) => {
 
 exports.getEventById = async (req, res) => {
   try {
-    const event = await Event.findById(req.params.id);
+    const event = await Event.findById(req.params.id)
+      .populate("organizerId", "organizerName");
 
     if (!event) {
       return res.status(404).json({ message: "Event not found" });
@@ -754,7 +887,11 @@ exports.updateEvent = async (req, res) => {
 exports.markAttendance = async (req, res) => {
   try {
     const { ticketId } = req.body;
-    const registration = await Registration.findOne({ ticketId });
+    const registration = await Registration.findOne({ ticketId })
+      .populate({
+        path: "participantId",
+        populate: { path: "userId", select: "email" },
+      });
 
     if (!registration) return res.status(404).json({ message: "Invalid Ticket ID" });
 
@@ -762,13 +899,169 @@ exports.markAttendance = async (req, res) => {
       return res.status(400).json({ message: "Ticket is cancelled" });
     }
 
+    // Duplicate scan rejection
+    if (registration.attended) {
+      return res.status(409).json({
+        message: "Already scanned — attendance was already marked",
+        attendedAt: registration.attendedAt,
+        participant: {
+          name: `${registration.participantId.firstName} ${registration.participantId.lastName}`,
+          email: registration.participantId.userId?.email,
+        },
+        duplicate: true,
+      });
+    }
+
     registration.attended = true;
+    registration.attendedAt = new Date();
     registration.status = "ATTENDED";
+    registration.attendanceAuditLog.push({
+      action: "MARK",
+      reason: "QR/Ticket scan",
+      performedBy: req.user.userId,
+    });
     await registration.save();
 
-    res.json({ message: "Attendance marked successfully", attended: true });
+    res.json({
+      message: "Attendance marked successfully",
+      attended: true,
+      attendedAt: registration.attendedAt,
+      participant: {
+        name: `${registration.participantId.firstName} ${registration.participantId.lastName}`,
+        email: registration.participantId.userId?.email,
+      },
+      ticketId: registration.ticketId,
+    });
   } catch (err) {
     res.status(500).json({ message: "Failed to mark attendance", error: err.message });
+  }
+};
+
+// Scan QR code for attendance (parses QR JSON payload)
+exports.scanQRAttendance = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { qrData } = req.body;
+
+    // Parse QR data
+    let parsed;
+    try {
+      parsed = JSON.parse(qrData);
+    } catch (e) {
+      return res.status(400).json({ message: "Invalid QR code data" });
+    }
+
+    const { ticketId, eventId: qrEventId } = parsed;
+
+    if (!ticketId) {
+      return res.status(400).json({ message: "QR code does not contain a ticket ID" });
+    }
+
+    // Validate event match
+    if (qrEventId && qrEventId !== eventId) {
+      return res.status(400).json({ message: "This ticket belongs to a different event" });
+    }
+
+    const registration = await Registration.findOne({ ticketId, eventId })
+      .populate({
+        path: "participantId",
+        populate: { path: "userId", select: "email" },
+      });
+
+    if (!registration) {
+      return res.status(404).json({ message: "Ticket not found for this event" });
+    }
+
+    if (registration.status === "CANCELLED" || registration.status === "REJECTED") {
+      return res.status(400).json({ message: `Ticket status: ${registration.status}` });
+    }
+
+    // Duplicate scan rejection
+    if (registration.attended) {
+      return res.status(409).json({
+        message: "Already scanned",
+        attendedAt: registration.attendedAt,
+        participant: {
+          name: `${registration.participantId.firstName} ${registration.participantId.lastName}`,
+          email: registration.participantId.userId?.email,
+        },
+        duplicate: true,
+      });
+    }
+
+    registration.attended = true;
+    registration.attendedAt = new Date();
+    registration.status = "ATTENDED";
+    registration.attendanceAuditLog.push({
+      action: "MARK",
+      reason: "QR scan",
+      performedBy: req.user.userId,
+    });
+    await registration.save();
+
+    res.json({
+      message: "Attendance marked!",
+      attended: true,
+      attendedAt: registration.attendedAt,
+      participant: {
+        name: `${registration.participantId.firstName} ${registration.participantId.lastName}`,
+        email: registration.participantId.userId?.email,
+      },
+      ticketId,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Scan failed", error: err.message });
+  }
+};
+
+// Manual override attendance (with audit logging)
+exports.manualOverrideAttendance = async (req, res) => {
+  try {
+    const { eventId } = req.params;
+    const { registrationId, action, reason } = req.body;
+
+    if (!reason || reason.trim().length === 0) {
+      return res.status(400).json({ message: "Reason is required for manual override" });
+    }
+
+    if (!["MARK", "UNMARK"].includes(action)) {
+      return res.status(400).json({ message: "Action must be MARK or UNMARK" });
+    }
+
+    const registration = await Registration.findOne({ _id: registrationId, eventId })
+      .populate({
+        path: "participantId",
+        populate: { path: "userId", select: "email" },
+      });
+
+    if (!registration) {
+      return res.status(404).json({ message: "Registration not found" });
+    }
+
+    if (action === "MARK") {
+      registration.attended = true;
+      registration.attendedAt = new Date();
+      registration.status = "ATTENDED";
+    } else {
+      registration.attended = false;
+      registration.attendedAt = null;
+      registration.status = "REGISTERED";
+    }
+
+    registration.attendanceAuditLog.push({
+      action: "OVERRIDE",
+      reason: reason.trim(),
+      performedBy: req.user.userId,
+    });
+
+    await registration.save();
+
+    res.json({
+      message: `Attendance ${action === "MARK" ? "marked" : "unmarked"} via manual override`,
+      registration,
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Override failed", error: err.message });
   }
 };
 
@@ -776,18 +1069,22 @@ exports.exportParticipantsCSV = async (req, res) => {
   try {
     const { eventId } = req.params;
 
-    // Ownership check (simplified)
     const organizer = await OrganizerProfile.findOne({ userId: req.user.userId });
     if (!organizer) return res.status(403).json({ message: "Access denied" });
 
     const registrations = await Registration.find({ eventId })
-      .populate("participantId", "firstName lastName email contactNumber");
+      .populate({
+        path: "participantId",
+        populate: { path: "userId", select: "email" },
+      });
 
-    let csv = "Name,Email,Contact,TicketID,Status,Attended\n";
+    let csv = "Name,Email,Contact,TicketID,Status,Attended,AttendedAt\n";
 
     registrations.forEach(reg => {
       const p = reg.participantId;
-      csv += `"${p.firstName} ${p.lastName}","${p.userId.email}","${p.contactNumber}","${reg.ticketId}","${reg.status}","${reg.attended}"\n`;
+      const email = p.userId?.email || "";
+      const attendedAt = reg.attendedAt ? new Date(reg.attendedAt).toISOString() : "";
+      csv += `"${p.firstName} ${p.lastName}","${email}","${p.contactNumber}","${reg.ticketId || ""}","${reg.status}","${reg.attended}","${attendedAt}"\n`;
     });
 
     res.header("Content-Type", "text/csv");
@@ -795,5 +1092,42 @@ exports.exportParticipantsCSV = async (req, res) => {
     res.send(csv);
   } catch (err) {
     res.status(500).json({ message: "Failed to export CSV" });
+  }
+};
+
+// Public organizer details (accessible to any authenticated user)
+exports.getOrganizerPublicDetails = async (req, res) => {
+  try {
+    const { organizerId } = req.params;
+
+    const organizer = await OrganizerProfile.findById(
+      organizerId,
+      "organizerName category description contactEmail"
+    );
+
+    if (!organizer) {
+      return res.status(404).json({ message: "Organizer not found" });
+    }
+
+    const events = await Event.find({
+      organizerId,
+      status: "PUBLISHED",
+    }).sort({ eventStartDate: 1 });
+
+    const upcoming = events.filter(
+      (e) => new Date(e.eventStartDate) >= new Date()
+    );
+
+    const past = events.filter(
+      (e) => new Date(e.eventStartDate) < new Date()
+    );
+
+    res.json({
+      Organizer: organizer,
+      Upcoming: upcoming,
+      Past: past,
+    });
+  } catch (error) {
+    res.status(500).json({ message: "Failed to fetch organizer details" });
   }
 };

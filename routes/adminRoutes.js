@@ -24,4 +24,9 @@ router.patch("/reset-password/:userId", authenticate, adminOnly, adminController
 router.patch("/organizers/:userId/disable", authenticate, adminOnly, adminController.disableOrganizer);
 router.delete("/organizers/:userId", authenticate, adminOnly, adminController.deleteOrganizer);
 
+// Password Reset Requests
+router.get("/reset-requests", authenticate, adminOnly, adminController.getResetRequests);
+router.patch("/reset-requests/:requestId/approve", authenticate, adminOnly, adminController.approveResetRequest);
+router.patch("/reset-requests/:requestId/reject", authenticate, adminOnly, adminController.rejectResetRequest);
+
 module.exports = router;

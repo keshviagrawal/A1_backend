@@ -94,6 +94,13 @@ exports.resetOrganizerPassword = async (req, res) => {
     user.password = hashedPassword;
     await user.save();
 
+    // Also resolve any pending reset requests for this organizer
+    const PasswordResetRequest = require("../models/PasswordResetRequest");
+    await PasswordResetRequest.updateMany(
+      { organizerId: userId, status: "PENDING" },
+      { status: "APPROVED", adminComment: "Reset directly by admin", resolvedAt: new Date() }
+    );
+
     // Fetching organizer profile
     const organizerProfile = await OrganizerProfile.findOne({ userId });
 
@@ -198,9 +205,8 @@ exports.getSystemStats = async (req, res) => {
   try {
     const totalOrganizers = await User.countDocuments({ role: "organizer" });
     const totalParticipants = await User.countDocuments({ role: "participant" });
-    // Use string requires to avoid circular dependency issues if any, or just standard require
     const totalEvents = await require("../models/Events").countDocuments();
-    const totalRegistrations = await require("../models/Registration").countDocuments(); // Assuming Registration model exists
+    const totalRegistrations = await require("../models/Registration").countDocuments();
 
     res.json({
       totalOrganizers,
@@ -211,5 +217,97 @@ exports.getSystemStats = async (req, res) => {
   } catch (err) {
     console.error("Stats fetch error:", err);
     res.status(500).json({ message: "Failed to fetch system stats" });
+  }
+};
+
+// ===== PASSWORD RESET REQUEST MANAGEMENT =====
+
+const PasswordResetRequest = require("../models/PasswordResetRequest");
+
+// Get all reset requests (with optional status filter)
+exports.getResetRequests = async (req, res) => {
+  try {
+    const { status } = req.query;
+    const filter = status ? { status } : {};
+    const requests = await PasswordResetRequest.find(filter).sort({ createdAt: -1 });
+    res.json(requests);
+  } catch (err) {
+    res.status(500).json({ message: "Failed to fetch reset requests", error: err.message });
+  }
+};
+
+// Approve reset request — auto-generate password + email
+exports.approveResetRequest = async (req, res) => {
+  try {
+    const { requestId } = req.params;
+
+    const request = await PasswordResetRequest.findById(requestId);
+    if (!request) return res.status(404).json({ message: "Request not found" });
+    if (request.status !== "PENDING") return res.status(400).json({ message: "Request already processed" });
+
+    const user = await User.findById(request.organizerId);
+    if (!user) return res.status(404).json({ message: "Organizer user not found" });
+
+    // Generate new password
+    const newPassword = Math.random().toString(36).slice(-8);
+    const hashedPassword = await bcrypt.hash(newPassword, 10);
+    user.password = hashedPassword;
+    await user.save();
+
+    // Update request
+    request.status = "APPROVED";
+    request.adminComment = req.body.comment || "";
+    request.resolvedAt = new Date();
+    await request.save();
+
+    // Email organizer
+    const profile = await OrganizerProfile.findOne({ userId: request.organizerId });
+    try {
+      await sendEmail({
+        to: profile?.contactEmail || user.email,
+        subject: "Password Reset Approved",
+        text: `Hello ${request.organizerName},
+
+Your password reset request has been approved.
+
+Login Email: ${user.email}
+New Password: ${newPassword}
+
+Please change your password after logging in.
+
+Regards,
+Felicity Portal Team`,
+      });
+    } catch (emailErr) {
+      console.error("Failed to send reset email:", emailErr);
+    }
+
+    res.json({
+      message: "Request approved — new password generated and emailed",
+      newPassword, // Admin can also see this
+    });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to approve request", error: err.message });
+  }
+};
+
+// Reject reset request
+exports.rejectResetRequest = async (req, res) => {
+  try {
+    const { requestId } = req.params;
+    const { comment } = req.body;
+
+    const request = await PasswordResetRequest.findById(requestId);
+    if (!request) return res.status(404).json({ message: "Request not found" });
+    if (request.status !== "PENDING") return res.status(400).json({ message: "Request already processed" });
+
+    request.status = "REJECTED";
+    request.adminComment = comment || "";
+    request.resolvedAt = new Date();
+    await request.save();
+
+    res.json({ message: "Request rejected" });
+  } catch (err) {
+    res.status(500).json({ message: "Failed to reject request", error: err.message });
   }
 };

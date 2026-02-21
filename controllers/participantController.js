@@ -105,8 +105,18 @@ exports.unfollowOrganizer = async (req, res) => {
 // Get all organizers (for onboarding/follow page)
 exports.getAllOrganizers = async (req, res) => {
   try {
-    const organizers = await OrganizerProfile.find({}, "organizerName category description");
-    res.json(organizers);
+    const organizers = await OrganizerProfile.find({}, "organizerName category description contactEmail");
+
+    // Check which organizers the current participant follows
+    const participant = await ParticipantProfile.findOne({ userId: req.user.userId });
+    const followedIds = participant?.followedOrganizers?.map(id => id.toString()) || [];
+
+    const result = organizers.map(org => ({
+      ...org.toObject(),
+      isFollowed: followedIds.includes(org._id.toString()),
+    }));
+
+    res.json(result);
   } catch (error) {
     res.status(500).json({ message: "Failed to fetch organizers", error: error.message });
   }
