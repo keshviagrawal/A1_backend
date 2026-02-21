@@ -168,19 +168,21 @@ exports.participantSignup = async (req, res) => {
     }
 
     // IIIT email validation
+    const iiitDomains = ["@iiit.ac.in", "@students.iiit.ac.in", "@research.iiit.ac.in"];
     if (participantType === "IIIT") {
-      if (!email.endsWith("@iiit.ac.in")) {
+      const isValidIIIT = iiitDomains.some(domain => email.endsWith(domain));
+      if (!isValidIIIT) {
         return res.status(400).json({
-          message: "IIIT participants must use IIIT email (@iiit.ac.in)",
+          message: "IIIT participants must use IIIT email (@iiit.ac.in, @students.iiit.ac.in, or @research.iiit.ac.in)",
         });
       }
-    } else {
-      // Non-IIIT must provide password
-      if (!password) {
-        return res.status(400).json({
-          message: "Password is required for Non-IIIT participants",
-        });
-      }
+    }
+
+    // Password is required for all users
+    if (!password) {
+      return res.status(400).json({
+        message: "Password is required",
+      });
     }
 
     const existingUser = await User.findOne({ email });
@@ -188,11 +190,8 @@ exports.participantSignup = async (req, res) => {
       return res.status(400).json({ message: "User already exists" });
     }
 
-    // For IIIT: generate random password (they won't use it)
-    // For Non-IIIT: use provided password
-    const passwordToHash = participantType === "IIIT"
-      ? Math.random().toString(36).slice(-12)
-      : password;
+    // All users provide their own password now
+    const passwordToHash = password;
 
     const hashedPassword = await bcrypt.hash(passwordToHash, 10);
 
@@ -244,30 +243,14 @@ exports.login = async (req, res) => {
       });
     }
 
-    // Check if IIIT participant (email-only login)
-    let isIIITParticipant = false;
-    if (user.role === "participant") {
-      const profile = await ParticipantProfile.findOne({ userId: user._id });
-      isIIITParticipant = profile?.participantType === "IIIT";
+    // All users require password
+    if (!password) {
+      return res.status(400).json({ message: "Password is required" });
     }
 
-    // For IIIT: just verify email domain, no password check
-    // For others: verify password
-    if (isIIITParticipant) {
-      if (!email.endsWith("@iiit.ac.in")) {
-        return res.status(401).json({ message: "Invalid IIIT email" });
-      }
-      // No password check for IIIT students
-    } else {
-      // Non-IIIT and other roles require password
-      if (!password) {
-        return res.status(400).json({ message: "Password is required" });
-      }
-
-      const isMatch = await bcrypt.compare(password, user.password);
-      if (!isMatch) {
-        return res.status(401).json({ message: "Invalid credentials" });
-      }
+    const isMatch = await bcrypt.compare(password, user.password);
+    if (!isMatch) {
+      return res.status(401).json({ message: "Invalid credentials" });
     }
 
     const token = jwt.sign(

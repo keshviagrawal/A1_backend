@@ -15,7 +15,14 @@ exports.getProfile = async (req, res) => {
       return res.status(404).json({ message: "Profile not found" });
     }
 
-    res.json(profile);
+    // Include email from User model
+    const User = require("../models/User");
+    const user = await User.findById(req.user.userId).select("email");
+
+    const profileObj = profile.toObject();
+    profileObj.email = user?.email || "";
+
+    res.json(profileObj);
   } catch (error) {
     res.status(500).json({ message: "Failed to fetch profile", error: error.message });
   }
@@ -124,7 +131,7 @@ exports.getAllOrganizers = async (req, res) => {
 
 exports.updateProfile = async (req, res) => {
   try {
-    const { firstName, lastName, contactNumber, interests, followedOrganizers } = req.body;
+    const { firstName, lastName, contactNumber, collegeOrOrgName, interests, followedOrganizers } = req.body;
 
     const participant = await ParticipantProfile.findOne({ userId: req.user.userId });
 
@@ -135,7 +142,8 @@ exports.updateProfile = async (req, res) => {
     // Update fields
     if (firstName) participant.firstName = firstName;
     if (lastName) participant.lastName = lastName;
-    if (contactNumber) participant.contactNumber = contactNumber;
+    if (contactNumber !== undefined) participant.contactNumber = contactNumber;
+    if (collegeOrOrgName) participant.collegeOrOrgName = collegeOrOrgName;
     if (interests) participant.interests = interests;
     if (followedOrganizers) participant.followedOrganizers = followedOrganizers;
 

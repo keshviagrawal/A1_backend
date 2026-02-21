@@ -706,8 +706,48 @@ exports.getPublishedEvents = async (req, res) => {
     }
 
     const events = await Event.find(query)
-      .populate("organizerId", "organizerName")
+      .populate("organizerId", "organizerName category")
       .sort({ createdAt: -1 });
+
+    // ---- Preference-based ordering for participants ----
+    if (req.user && req.user.role === "participant") {
+      try {
+        const profile = await ParticipantProfile.findOne({ userId: req.user.userId });
+        if (profile && (profile.interests.length > 0 || profile.followedOrganizers.length > 0)) {
+          const followedIds = profile.followedOrganizers.map(id => id.toString());
+          const interests = profile.interests.map(i => i.toLowerCase());
+
+          const scored = events.map(event => {
+            let score = 0;
+            const e = event.toObject ? event.toObject() : event;
+
+            // +10 if organizer is followed
+            if (e.organizerId && followedIds.includes(e.organizerId._id?.toString())) {
+              score += 10;
+            }
+
+            // +5 for each matching interest in event tags
+            if (e.tags && e.tags.length > 0) {
+              const matchingTags = e.tags.filter(t => interests.includes(t.toLowerCase()));
+              score += matchingTags.length * 5;
+            }
+
+            // +5 if organizer category matches an interest
+            if (e.organizerId?.category && interests.includes(e.organizerId.category.toLowerCase())) {
+              score += 5;
+            }
+
+            return { event, score };
+          });
+
+          scored.sort((a, b) => b.score - a.score || new Date(b.event.createdAt) - new Date(a.event.createdAt));
+          return res.json(scored.map(s => s.event));
+        }
+      } catch (prefErr) {
+        // If preference scoring fails, fall through to default order
+        console.error("Preference scoring error:", prefErr.message);
+      }
+    }
 
     res.json(events);
   } catch (err) {
